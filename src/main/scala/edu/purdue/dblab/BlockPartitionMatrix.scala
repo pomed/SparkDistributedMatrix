@@ -19,15 +19,16 @@ class BlockPartitionMatrix (
     val ROWS_PER_BLK: Int,
     val COLS_PER_BLK: Int,
     private var nrows: Long,
-    private var ncols: Long
-    ) extends Matrix with Logging {
+    private var ncols: Long) extends Matrix with Logging {
 
     val ROW_BLK_NUM = math.ceil(nRows() * 1.0 / ROWS_PER_BLK).toInt
     val COL_BLK_NUM = math.ceil(nCols() * 1.0 / COLS_PER_BLK).toInt
 
     private var groupByCached: RDD[(Int, Iterable[(Int, MLMatrix)])] = null
 
-    private val numPartitions = 8 // 8 workers
+    private val numPartitions: Int = 8 // 8 workers
+
+    private var sparsity: Double = 0.0
 
 
     override def nRows(): Long = {
@@ -54,6 +55,22 @@ class BlockPartitionMatrix (
         }.sum().toLong
     }
 
+    // sparsity is defined as nnz / (m * n) where m and n are number of rows and cols
+    // Is this a fast operation? Does there exist any better way to get the precise
+    // sparsity info of the underlying distributed matrix.
+    def getSparsity(): Double = {
+        if (sparsity <= 0) {
+            val nnz = blocks.map { case ((rid, cid), mat) =>
+                mat match {
+                    case den: DenseMatrix => den.values.length
+                    case sp: SparseMatrix => sp.values.length
+                }
+            }.reduce(_ + _)
+            sparsity = nnz * 1.0 / (nRows() * nCols())
+        }
+        sparsity
+    }
+
     def stat() = {
         println("-" * 40 )
         println(s"Block partition matrix has $ROW_BLK_NUM row blks")
@@ -63,6 +80,8 @@ class BlockPartitionMatrix (
         println(s"Matrix has ${nCols()} cols")
         println("-" * 40 )
     }
+
+    def partitioner = blocks.partitioner.get
 
     private type MatrixBlk = ((Int, Int), MLMatrix)
     private type PartitionScheme = (Int, Int)
@@ -186,8 +205,84 @@ class BlockPartitionMatrix (
         multiplyScalar(alpha)
     }
 
+    def *(other: BlockPartitionMatrix, partitioner: Partitioner): BlockPartitionMatrix = {
+        require(nRows() == other.nRows(), s"Two matrices must have the same number of rows. " +
+          s"A.rows: ${nRows()}, B.rows: ${other.nRows()}")
+        require(nCols() == other.nCols(), s"Two matrices must have the same number of cols. " +
+          s"A.cols: ${nCols()}, B.cols: ${other.nCols()}")
+        var rdd1 = blocks
+        if (!rdd1.partitioner.get.isInstanceOf[partitioner.type]) {
+            rdd1 = rdd1.partitionBy(partitioner)
+        }
+        var rdd2 = other.blocks
+        if (!rdd2.partitioner.get.isInstanceOf[partitioner.type]) {
+            rdd2 = rdd2.partitionBy(partitioner)
+        }
+        val rdd = rdd1.zipPartitions(rdd2, preservesPartitioning = true) {
+            case (iter1, iter2) =>
+                val idx2val = new TrieMap[(Int, Int), MLMatrix]()
+                val res = new TrieMap[(Int, Int), MLMatrix]()
+                for (elem <- iter1) {
+                    val key = elem._1
+                    if (!idx2val.contains(key)) idx2val.putIfAbsent(key, elem._2)
+                }
+                for (elem <- iter2) {
+                    val key = elem._1
+                    if (idx2val.contains(key)) {
+                        val tmp = idx2val.get(key).get
+                        res.putIfAbsent(key, LocalMatrix.elementWiseMultiply(tmp, elem._2))
+                    }
+                }
+            res.iterator
+        }
+        new BlockPartitionMatrix(rdd, ROWS_PER_BLK, COLS_PER_BLK, nRows(), nCols())
+    }
+
     def *:(alpha: Double): BlockPartitionMatrix = {
         multiplyScalar(alpha)
+    }
+
+    def /(alpha: Double): BlockPartitionMatrix = {
+        require(alpha != 0, "Block matrix divided by 0 error!")
+        multiplyScalar(1.0 / alpha)
+    }
+
+    def /:(alpha: Double): BlockPartitionMatrix = {
+        require(alpha != 0, "Block matrix divided by 0 error!")
+        multiplyScalar(1.0 / alpha)
+    }
+
+    def /(other: BlockPartitionMatrix, partitioner: Partitioner): BlockPartitionMatrix = {
+        require(nRows() == other.nRows(), s"Two matrices must have the same number of rows. " +
+          s"A.rows: ${nRows()}, B.rows: ${other.nRows()}")
+        require(nCols() == other.nCols(), s"Two matrices must have the same number of cols. " +
+          s"A.cols: ${nCols()}, B.cols: ${other.nCols()}")
+        var rdd1 = blocks
+        if (!rdd1.partitioner.get.isInstanceOf[partitioner.type]) {
+            rdd1 = rdd1.partitionBy(partitioner)
+        }
+        var rdd2 = other.blocks
+        if (!rdd2.partitioner.get.isInstanceOf[partitioner.type]) {
+            rdd2 = rdd2.partitionBy(partitioner)
+        }
+        val rdd = rdd1.zipPartitions(rdd2, preservesPartitioning = true) {
+            case (iter1, iter2) =>
+                val idx2val = new TrieMap[(Int, Int), MLMatrix]()
+                val res = new TrieMap[(Int, Int), MLMatrix]()
+                for (elem <- iter1) {
+                    val key = elem._1
+                    if (!idx2val.contains(key)) idx2val.putIfAbsent(key, elem._2)
+                }
+                for (elem <- iter2) {
+                    val key = elem._1
+                    if (idx2val.contains(key)) {
+                        val tmp = idx2val.get(key).get
+                        res.putIfAbsent(key, LocalMatrix.elementWiseDivide(tmp, elem._2))
+                    }
+                }
+                res.iterator
+        }
+        new BlockPartitionMatrix(rdd, ROWS_PER_BLK, COLS_PER_BLK, nRows(), nCols())
     }
 
     def multiplyScalar(alpha: Double): BlockPartitionMatrix = {
@@ -216,8 +311,10 @@ class BlockPartitionMatrix (
         this
     }
 
-    def +(other: BlockPartitionMatrix, dimension: PartitionScheme = (ROWS_PER_BLK, COLS_PER_BLK)): BlockPartitionMatrix = {
-        add(other, dimension)
+    def +(other: BlockPartitionMatrix,
+          dimension: PartitionScheme = (ROWS_PER_BLK, COLS_PER_BLK),
+          partitioner: Partitioner): BlockPartitionMatrix = {
+        add(other, dimension, partitioner)
     }
 
     /*
@@ -225,7 +322,9 @@ class BlockPartitionMatrix (
      * different partitioning schemes, i.e., different `ROWS_PER_BLK` and `COLS_PER_BLK` values.
      * @param dimension, specifies the (ROWS_PER_PARTITION, COLS_PER_PARTITION) of the result
      */
-    def add(other: BlockPartitionMatrix, dimension: PartitionScheme = (ROWS_PER_BLK, COLS_PER_BLK)): BlockPartitionMatrix = {
+    def add(other: BlockPartitionMatrix,
+            dimension: PartitionScheme = (ROWS_PER_BLK, COLS_PER_BLK),
+            partitioner: Partitioner): BlockPartitionMatrix = {
         val t1 = System.currentTimeMillis()
         require(nRows() == other.nRows(), s"Two matrices must have the same number of rows. " +
         s"A.rows: ${nRows()}, B.rows: ${other.nRows()}")
@@ -247,7 +346,8 @@ class BlockPartitionMatrix (
             }
             var (rddA, rddB) = (blocks, other.blocks)
             if (repartA) {
-                rddA = getNewBlocks(blocks, ROWS_PER_BLK, COLS_PER_BLK, dimension._1, dimension._2)
+                rddA = getNewBlocks(blocks, ROWS_PER_BLK, COLS_PER_BLK,
+                    dimension._1, dimension._2, partitioner)
                 /*rddA.foreach{
                     x =>
                         val (row, col) = x._1
@@ -257,7 +357,8 @@ class BlockPartitionMatrix (
                 }*/
             }
             if (repartB) {
-                rddB = getNewBlocks(other.blocks, other.ROWS_PER_BLK, other.COLS_PER_BLK, dimension._1, dimension._2)
+                rddB = getNewBlocks(other.blocks, other.ROWS_PER_BLK, other.COLS_PER_BLK,
+                    dimension._1, dimension._2, partitioner)
                 /*rddB.foreach{
                     x =>
                         val (row, col) = x._1
@@ -273,11 +374,10 @@ class BlockPartitionMatrix (
         }
     }
 
+    // rddA and rddB already partitioned in the same way
     private def addSameDim(rddA: RDD[MatrixBlk], rddB: RDD[MatrixBlk],
                             RPB: Int, CPB: Int): BlockPartitionMatrix = {
-        val rdd1 = rddA.partitionBy(genBlockPartitioner())
-        val rdd2 = rddB.partitionBy(genBlockPartitioner())
-        val rdd = rdd1.zipPartitions(rdd2, preservesPartitioning = true) { (iter1, iter2) =>
+        val rdd = rddA.zipPartitions(rddB, preservesPartitioning = true) { (iter1, iter2) =>
             val buf = new TrieMap[(Int, Int), MLMatrix]()
             for (a <- iter1) {
                 if (a != null) {
@@ -323,7 +423,9 @@ class BlockPartitionMatrix (
     }
 
     private def getNewBlocks(rdd: RDD[MatrixBlk],
-                             curRPB: Int, curCPB: Int, targetRPB: Int, targetCPB: Int): RDD[MatrixBlk] = {
+                             curRPB: Int, curCPB: Int,
+                             targetRPB: Int, targetCPB: Int,
+                             partitioner: Partitioner): RDD[MatrixBlk] = {
         val rddNew = rePartition(rdd, curRPB, curCPB, targetRPB, targetCPB)
         rddNew.groupByKey(genBlockPartitioner()).map {
             case ((rowIdx, colIdx), iter) =>
@@ -352,7 +454,7 @@ class BlockPartitionMatrix (
                     ((rowIdx, colIdx), new DenseMatrix(m, n, values).toSparse)
                 }
 
-        }
+        }.partitionBy(partitioner)
 
     }
     // RPB -- #rows_per_blk, CPB -- #cols_per_blk
@@ -380,7 +482,8 @@ class BlockPartitionMatrix (
                 for (j <- colRange; i <- rowRange) {
                     values += mat((i - rowOffset).toInt, (j - colOffset).toInt)
                 }
-                val elem = (rowRange(0), rowRange(rowRange.length - 1), colRange(0), colRange(colRange.length - 1), values.toArray)
+                val elem = (rowRange(0), rowRange(rowRange.length - 1),
+                  colRange(0), colRange(colRange.length - 1), values.toArray)
                 val entry = ((r, c), elem)
                 res += entry
             }
@@ -421,8 +524,10 @@ class BlockPartitionMatrix (
         var rddB = other.blocks
         //var useOtherMatrix: Boolean = false
         if (COLS_PER_BLK != other.ROWS_PER_BLK) {
-            logWarning(s"Repartition Matrix B since A.col_per_blk = $COLS_PER_BLK and B.row_per_blk = ${other.ROWS_PER_BLK}")
-            rddB = getNewBlocks(other.blocks, other.ROWS_PER_BLK, other.COLS_PER_BLK, COLS_PER_BLK, COLS_PER_BLK)
+            logWarning(s"Repartition Matrix B since A.col_per_blk = $COLS_PER_BLK " +
+              s"and B.row_per_blk = ${other.ROWS_PER_BLK}")
+            rddB = getNewBlocks(other.blocks, other.ROWS_PER_BLK, other.COLS_PER_BLK,
+                COLS_PER_BLK, COLS_PER_BLK, new RowPartitioner(numPartitions))
             //useOtherMatrix = true
         }
         // other.ROWS_PER_BLK = COLS_PER_BLK and square blk for other
@@ -471,7 +576,8 @@ class BlockPartitionMatrix (
         //var useOtherMatrix: Boolean = false
         if (COLS_PER_BLK != other.ROWS_PER_BLK) {
             logWarning(s"Repartition Matrix B since A.col_per_blk = $COLS_PER_BLK and B.row_per_blk = ${other.ROWS_PER_BLK}")
-            rddB = getNewBlocks(other.blocks, other.ROWS_PER_BLK, other.COLS_PER_BLK, COLS_PER_BLK, COLS_PER_BLK)
+            rddB = getNewBlocks(other.blocks, other.ROWS_PER_BLK, other.COLS_PER_BLK,
+                COLS_PER_BLK, COLS_PER_BLK, new RowPartitioner(numPartitions))
             //useOtherMatrix = true
         }
         // other.ROWS_PER_BLK = COLS_PER_BLK and square blk for other
@@ -583,7 +689,8 @@ class BlockPartitionMatrix (
         //var useOtherMatrix: Boolean = false
         if (COLS_PER_BLK != other.ROWS_PER_BLK) {
             logWarning(s"Repartition Matrix B since A.col_per_blk = $COLS_PER_BLK and B.row_per_blk = ${other.ROWS_PER_BLK}")
-            rddB = getNewBlocks(other.blocks, other.ROWS_PER_BLK, other.COLS_PER_BLK, COLS_PER_BLK, COLS_PER_BLK)
+            rddB = getNewBlocks(other.blocks, other.ROWS_PER_BLK, other.COLS_PER_BLK,
+                COLS_PER_BLK, COLS_PER_BLK, new RowPartitioner(numPartitions))
             //useOtherMatrix = true
         }
 
@@ -623,6 +730,13 @@ class BlockPartitionMatrix (
         new BlockPartitionMatrix(prodRDD, ROWS_PER_BLK, COLS_PER_BLK, nRows(), other.nCols())
     }
 
+    def frobenius(): Double = {
+        val t = blocks.map { case ((i, j), mat) =>
+            val x = LocalMatrix.frobenius(mat)
+            x * x
+        }.reduce(_ + _)
+        math.sqrt(t)
+    }
 }
 
 object BlockPartitionMatrix {
@@ -744,7 +858,7 @@ object TestBlockPartition {
         val rdd2 = sc.parallelize(arr2, 2)
         val mat1 = new BlockPartitionMatrix(rdd1, 3, 3, 6, 6)
         val mat2 = new BlockPartitionMatrix(rdd2, 4, 4, 6, 6)
-        println(mat1.add(mat2).toLocalMatrix())
+        //println(mat1.add(mat2).toLocalMatrix())
         /*  addition
          *  2.0   3.0   4.0   6.0   7.0   8.0
             8.0   9.0   10.0  12.0  13.0  14.0
@@ -753,7 +867,7 @@ object TestBlockPartition {
             28.0  29.0  30.0  32.0  33.0  34.0
             34.0  35.0  36.0  38.0  39.0  40.0
          */
-        //println((mat1 %*% mat2).toLocalMatrix())
+        println((mat1 %*% mat2).toLocalMatrix())
         /*   multiplication
              51    51    51    72    72    72
              123   123   123   180   180   180
